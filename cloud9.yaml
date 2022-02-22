@@ -1,0 +1,167 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Metadata:
+  License: Apache-2.0
+Description: 'AWS CloudFormation Template to deploy Cloud9 '
+
+Parameters:
+  VPCCidrBlock:
+    Type: String
+    Default: 192.168.0.0/16
+  apiGatewayName:
+    Type: String
+    Default: update-security-group
+  apiGatewayStageName:
+    Type: String
+    AllowedPattern: "[a-z0-9]+"
+    Default: validate
+  apiGatewayHTTPMethod:
+    Type: String
+    Default: GET
+Resources:
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VPCCidrBlock
+      EnableDnsHostnames: True
+      Tags:
+        - Key: Name
+          Value: Cloud9
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      CidrBlock: !Ref VPCCidrBlock
+      VpcId: !Ref 'VPC'
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: Cloud9
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+  GatewayAttachement:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref 'VPC'
+      InternetGatewayId: !Ref 'InternetGateway'
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref 'VPC'
+      Tags:
+        - Key: Name
+          Value: Cloud9
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: GatewayAttachement
+    Properties:
+      RouteTableId: !Ref 'PublicRouteTable'
+      DestinationCidrBlock: '0.0.0.0/0'
+      GatewayId: !Ref 'InternetGateway'
+  PublicSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+  Cloud9:
+    Type: AWS::Cloud9::EnvironmentEC2
+    Properties:
+      ImageId: amazonlinux-2-x86_64
+      InstanceType: t3.medium
+      SubnetId: !Ref 'PublicSubnet'
+      #OwnerArn: !Sub "arn:aws:sts::${AWS::AccountId}:assumed-role/TeamRole/MasterKey" - Without owner Arn the Environment will be allocated to whoever created it.
+
+  apiGateway:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Description: Rest API to update Ec2 security group
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+      Name: !Ref apiGatewayName
+  apiGatewayRootMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: NONE
+      HttpMethod: !Ref apiGatewayHTTPMethod
+      Integration:
+        IntegrationHttpMethod: POST
+        Type: AWS_PROXY
+        Uri: !Sub
+          - arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${lambdaArn}/invocations
+          - lambdaArn: !GetAtt lambdaFunction.Arn
+      ResourceId: !GetAtt apiGateway.RootResourceId
+      RestApiId: !Ref apiGateway
+  apiGatewayDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - apiGatewayRootMethod
+    Properties:
+      RestApiId: !Ref apiGateway
+      StageName: !Ref apiGatewayStageName
+
+      ###bellow function inserts a rule in the Ec2 security group of the
+      ###Cloud9 instance allowing ingress from the caller (IP) to the Cloud9 public Ip on port 8080
+  lambdaFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: index.handler
+      MemorySize: 128
+      Timeout: 3
+      Runtime: python3.9
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - ec2:DescribeSecurityGroups
+                - ec2:DescribeTags
+                - ec2:DescribeInstances
+                - ec2:AuthorizeSecurityGroupIngress
+              Resource: '*'
+      Environment:
+        Variables:
+         Cloud9id: !Ref Cloud9
+      InlineCode: |
+          import boto3
+          import os
+          import json
+          def handler(event, context):
+            userip = (event['requestContext']['identity']['sourceIp'])
+            environmentid = os.environ['Cloud9id']
+            ec2 = boto3.client('ec2')
+            describe_security_groups = ec2.describe_security_groups(
+            Filters = [{'Name': 'tag:aws:cloud9:environment', 'Values': [environmentid]}])
+            sgid = (describe_security_groups['SecurityGroups'][0]['GroupId'])
+            response = ec2.authorize_security_group_ingress(
+            CidrIp=(userip+'/32'),
+            FromPort=8080,
+            GroupId=sgid,
+            IpProtocol='tcp',
+            ToPort=8080
+            )
+            describe_instance = ec2.describe_instances(
+            Filters = [{'Name': 'tag:aws:cloud9:environment', 'Values': [environmentid]}]
+            )
+            cloud9_dns = (describe_instance['Reservations'][0]['Instances'][0]['PublicDnsName'])
+            return {
+            'statusCode': (response['ResponseMetadata']['HTTPStatusCode']),
+            'isBase64Encoded': False,
+            'headers': {
+              'Content-Type': 'text/html'
+            },
+            'body': f'<a href="http://{cloud9_dns}:8080">Click Here!</a>'
+            }
+  lambdaApiGatewayInvoke:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt lambdaFunction.Arn
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${apiGateway}/${apiGatewayStageName}/${apiGatewayHTTPMethod}/
+
+Outputs:
+  apiGatewayInvokeURL:
+    Value: !Sub https://${apiGateway}.execute-api.${AWS::Region}.amazonaws.com/${apiGatewayStageName}
+
+
+
